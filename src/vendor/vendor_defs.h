@@ -114,6 +114,9 @@
 // Location of OB-UDP-ST (speed test) executable
 #define UDPST_PATH "/opt/udpst"
 
+// Location of ping executable used by Device.IP.Diagnostics.IPPing()
+#define PING_PATH "/bin/ping"
+
 //-----------------------------------------------------------------------------------------
 // Definitions associated with grouped parameter get/set
 // Each group represents a software component that can set/get a list of data model parameters in a single operation via RPC/messaging

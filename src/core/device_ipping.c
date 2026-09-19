@@ -44,6 +44,9 @@
 #include <string.h>
 #include <ctype.h>
 #include <errno.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/wait.h>
 
 #include "common_defs.h"
 #include "usp_api.h"
@@ -134,7 +137,8 @@ int DEVICE_IPPING_Init(void)
 **
 ** HostIsSafe
 **
-** Validates that Host contains only characters safe to pass to ping
+** Validates that Host contains only characters safe to pass as an execve argument
+** (hostname / IPv4 / IPv6 literal). Defense in depth in addition to avoiding a shell.
 **
 ** \param   host - host name or IP address
 **
@@ -315,7 +319,8 @@ exit:
 **
 ** ExecuteIPPing
 **
-** Runs the system ping utility and parses Success/Failure counts and RTT
+** Runs the system ping utility via fork/execve (no shell) and parses
+** Success/Failure counts and RTT. Pattern matches IPLCap_Execute.
 **
 ** \param   cond - pointer to input conditions
 ** \param   res - pointer to output results
@@ -325,10 +330,18 @@ exit:
 **************************************************************************/
 int ExecuteIPPing(ipping_input_cond_t *cond, ipping_output_res_t *res)
 {
-    char cmd[384];
-    FILE *fp;
+    char count_buf[16];
+    char timeout_buf[16];
+    char *argv[7];
     char line[512];
     unsigned timeout_sec;
+    int p[2];
+    int rc;
+    int status;
+    pid_t pid;
+    pid_t w_pid;
+    FILE *fp;
+    int err = USP_ERR_OK;
 
     res->success_count = 0;
     res->failure_count = 0;
@@ -348,13 +361,60 @@ int ExecuteIPPing(ipping_input_cond_t *cond, ipping_output_res_t *res)
         timeout_sec = 60;
     }
 
-    USP_SNPRINTF(cmd, sizeof(cmd), "ping -c %u -W %u %s 2>&1",
-                 cond->number_of_repetitions, timeout_sec, cond->host);
+    USP_SNPRINTF(count_buf, sizeof(count_buf), "%u", cond->number_of_repetitions);
+    USP_SNPRINTF(timeout_buf, sizeof(timeout_buf), "%u", timeout_sec);
 
-    fp = popen(cmd, "r");
+    // Build argv for execve — each Host/arg is a separate string (no shell)
+    argv[0] = (char *)PING_PATH;
+    argv[1] = "-c";
+    argv[2] = count_buf;
+    argv[3] = "-W";
+    argv[4] = timeout_buf;
+    argv[5] = cond->host;
+    argv[6] = NULL;
+
+    USP_LOG_Info("=== Executing IPPing: %s -c %s -W %s %s ===",
+                 PING_PATH, count_buf, timeout_buf, cond->host);
+
+    // Exit if unable to create a pipe to get ping stdout/stderr
+    rc = pipe2(p, O_CLOEXEC);
+    if (rc == -1)
+    {
+        USP_SNPRINTF(res->err_msg, sizeof(res->err_msg), "%s: pipe2() failed: %s", __FUNCTION__, strerror(errno));
+        return USP_ERR_COMMAND_FAILURE;
+    }
+
+    // Exit if unable to fork (child will exec ping)
+    pid = fork();
+    if (pid == -1)
+    {
+        close(p[0]);
+        close(p[1]);
+        USP_SNPRINTF(res->err_msg, sizeof(res->err_msg), "%s: fork() failed: %s", __FUNCTION__, strerror(errno));
+        return USP_ERR_COMMAND_FAILURE;
+    }
+
+    // Child process: run ping
+    if (pid == 0)
+    {
+        close(p[0]);
+        dup2(p[1], STDOUT_FILENO);
+        dup2(STDOUT_FILENO, STDERR_FILENO);
+        close(p[1]);
+
+        // NOTE: If successful, execve does not return
+        execve(PING_PATH, argv, NULL);
+        _exit(127);
+    }
+
+    // Parent process: read ping output
+    close(p[1]);
+    fp = fdopen(p[0], "r");
     if (fp == NULL)
     {
-        USP_SNPRINTF(res->err_msg, sizeof(res->err_msg), "%s: popen(ping) failed: %s", __FUNCTION__, strerror(errno));
+        close(p[0]);
+        waitpid(pid, &status, 0);
+        USP_SNPRINTF(res->err_msg, sizeof(res->err_msg), "%s: fdopen() failed: %s", __FUNCTION__, strerror(errno));
         return USP_ERR_COMMAND_FAILURE;
     }
 
@@ -390,14 +450,21 @@ int ExecuteIPPing(ipping_input_cond_t *cond, ipping_output_res_t *res)
         }
     }
 
-    pclose(fp);
+    fclose(fp);  // also closes p[0]
+
+    w_pid = waitpid(pid, &status, 0);
+    if (w_pid == -1)
+    {
+        USP_SNPRINTF(res->err_msg, sizeof(res->err_msg), "%s: waitpid failed: %s", __FUNCTION__, strerror(errno));
+        return USP_ERR_COMMAND_FAILURE;
+    }
 
     if ((res->success_count == 0) && (res->failure_count == 0))
     {
         res->failure_count = cond->number_of_repetitions;
     }
 
-    return USP_ERR_OK;
+    return err;
 }
 
 #endif // REMOVE_IPPING_DIAG
